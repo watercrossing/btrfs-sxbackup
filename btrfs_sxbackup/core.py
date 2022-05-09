@@ -6,8 +6,10 @@
 # any later version.
 
 import collections
+from lib2to3.pytree import Base
 import logging
 import subprocess
+from threading import local
 import time
 import uuid
 import io
@@ -157,6 +159,7 @@ class Location:
         :param cmd: Command to execute
         :return: output
         """
+        self._log_debug("Check output on %s" %cmd)
         return shell.exec_check_output(cmd, self.url)
 
     def exec_call(self, cmd) -> int:
@@ -232,6 +235,115 @@ class Location:
         self._log_debug('updating property [%s] of [%s] to [%s]' % (property, path, value))
         self.exec_check_output('btrfs property set "%s" %s %s' % (path, property, value))
 
+    def transfer_btrfs_snapshot_withRsync(self,
+                                dest: 'Location',
+                                source_path: str = None,
+                                dest_path: str = None,
+                                source_parent_path: str = None,
+                                compress: bool = False,
+                                identical_filesystem: bool = False):
+        
+        source_path = self.build_path(source_path)
+        source_parent_path = self.build_path(source_parent_path) if source_parent_path else None
+        self._log_debug("dest_path: %s" %dest_path)
+        dest_path = dest.build_path(dest_path)
+        self._log_debug("dest_path: %s" %dest_path)
+
+        name = os.path.basename(source_path.rstrip(os.path.sep))
+        final_dest_path = os.path.join(dest_path, name)
+        self._log_debug("final_dest_path: %s" %final_dest_path)
+
+        if len(name) == 0:
+            raise ValueError('source base name cannot be empty')
+        if dest.dir_exists(final_dest_path):
+            raise Error('destination path [%s] already exists' % final_dest_path)
+
+        self._log_info('creating snapshot file with Rsync')
+
+
+        if not identical_filesystem:
+
+            ionice_command_str = 'ionice -c3'
+            create_command_str = ionice_command_str
+
+            if source_parent_path:
+                create_command_str += ' btrfs send -p "%s" "%s"' % (source_parent_path, source_path)
+            else:
+                create_command_str += ' btrfs send "%s"' % source_path
+            if compress:
+                create_command_str += ' | gzip'
+            
+            localFile = '%s.btrfs%s' % (source_path, ".gz" if compress else "")
+            remoteFile = '%s.btrfs%s' % (final_dest_path, ".gz" if compress else "")
+            
+            create_command_str += ' > "%s"' % localFile
+
+            
+            try:
+                #TODO: What about the stdout / stderr of this call?
+                self._log_debug("Running command: %s" %create_command_str)
+                
+                createCall = subprocess.run(self.build_subprocess_args(create_command_str), capture_output=True, check=True)
+
+                send_command_str = 'rsync -aP %s %s:"%s"' %(localFile, dest.url.hostname, dest_path)
+                self._log_debug("Running command: %s" %send_command_str)
+                
+                attemptCount = 0
+                while True:
+                    try:
+                        subprocess.check_call(self.build_subprocess_args(send_command_str), 
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+                    except subprocess.CalledProcessError as e:
+                        self._log_debug("Error in rsync attempt %d, sleeping a little and retrying" %attemptCount)
+                        attemptCount +=1
+                        time.sleep(10)
+                        if attemptCount > 6*60*12: # have spent 12h sleeping
+                            self._log_error("Have exceeded max attempts at retrying to rsync the file accross, aborting")
+                            # perhaps sleep a long time to improve change that we can delete the remote file?
+                            # Or just attempt to delete spurious .btrfs / .btrfs.gz files next time we transfer?
+                            raise e
+                
+                unpackCmd = "gunzip" if compress else "cat"
+                unpackCmd += ' "%s" | btrfs receive "%s"' %(remoteFile, dest_path)
+
+                self._log_debug("Running command: %s" %unpackCmd)
+                try:
+                    #TODO: What about the stdout / stderr of this call?
+                    receiveCall = subprocess.run(dest.build_subprocess_args(unpackCmd), capture_output=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    self._log_error("Could not btrfs receive from rsync transferred file, error: %s" %repr(e))
+                    self._log_debug("receiveCall stdout is: %s" %str(receiveCall.stdout))
+                    self._log_debug("receiveCall stderr is: %s" %str(receiveCall.stderr))
+                    raise e
+                finally:
+                    self._log_info("Attempting to deleting remote file %s" %remoteFile)
+                    try:
+                        subprocess.check_call(dest.build_subprocess_args('rm "%s"' %remoteFile))
+                    except subprocess.CalledProcessError:
+                        self._log_error("Could not delete remote file")
+
+            except subprocess.CalledProcessError as e:
+                self._log_debug("createCall stdout is: %s" %str(createCall.stdout))
+                self._log_debug("createCall stderr is: %s" %str(createCall.stderr))
+                raise e
+            finally:
+                try:
+                    # Try to remove incomplete destination subvolume
+                    if os.path.exists(localFile):
+                        os.unlink(localFile)
+                except Exception as e2:
+                    self._log_warn('could not remove local temp rsync-send file [%s]' % localFile)
+
+            
+
+
+            
+        else:
+            self._log_info('Source and Destination snapshots are assumed to be on the same filesystem')
+            self.create_btrfs_snapshot(source_path, dest_path, set_ro=False)
+
+
     def transfer_btrfs_snapshot(self,
                                 dest: 'Location',
                                 source_path: str = None,
@@ -255,6 +367,7 @@ class Location:
 
         # Transfer temporary snapshot
         self._log_info('transferring snapshot')
+        
 
         # btrfs send command/subprocess
         ionice_command_str = 'ionice -c3'
@@ -357,6 +470,7 @@ class JobLocation(Location):
     __KEY_RETENTION = 'retention'
     __KEY_COMPRESS = 'compress'
     __KEY_IDENT_FS = 'identical_filesystem'
+    __KEY_USE_RSYNC = 'useRsync'
 
     TYPE_SOURCE = 'Source'
     TYPE_DESTINATION = 'Destination'
@@ -376,6 +490,7 @@ class JobLocation(Location):
         self.__retention = None
         self.__snapshots = []
         self.__identical_filesystem = False
+        self.__useRsync = False
 
         self.location_type = location_type
 
@@ -440,6 +555,14 @@ class JobLocation(Location):
     @compress.setter
     def compress(self, compress: bool):
         self.__compress = compress
+
+    @property
+    def useRsync(self) -> bool:
+        return self.__useRsync
+
+    @useRsync.setter
+    def useRsync(self, useRsync: bool):
+        self.__useRsync = useRsync
     
     @property
     def identical_filesystem(self) -> bool:
@@ -478,7 +601,11 @@ class JobLocation(Location):
         # Check and remove temporary snapshot volume (possible leftover of previously interrupted backup)
         temp_subvolume_path = os.path.join(self.container_subvolume_path, self.__TEMP_BASENAME)
         self.exec_check_output(
-            'if [ -d "%s"* ]; then btrfs sub del "%s"*; fi' % (temp_subvolume_path, temp_subvolume_path))
+            'for i in "%s"*; do [ -d "$i" ] || continue; btrfs sub del "$i"; done' % temp_subvolume_path)
+        
+        # Check if there are any temporary .btrfs* files leftover from previously interrupted backups)
+        self.exec_check_output(
+            'for i in "%s"*.btrfs*; do [ -f "$i" ] || continue; rm "$i"; done' % temp_subvolume_path)
 
     def retrieve_snapshots(self):
         """ Determine snapshot names. Snapshot names are sorted in reverse order (newest first).
@@ -625,6 +752,7 @@ class JobLocation(Location):
         retention = self.retention.expression_text if self.retention else None
         compress = self.compress
         identical_filesystem = self.identical_filesystem
+        useRsync = self.useRsync
 
         # Set configuration fields to write
         both_remote_or_local = not (
@@ -666,6 +794,8 @@ class JobLocation(Location):
             parser.set(section, self.__KEY_RETENTION, str(retention))
         if compress:
             parser.set(section, self.__KEY_COMPRESS, str(compress))
+        if useRsync:
+            parser.set(section, self.__KEY_USE_RSYNC, str(True))
         if identical_filesystem:
             parser.set(section, self.__KEY_IDENT_FS, str(identical_filesystem))
         parser.write(fileobject)
@@ -723,6 +853,9 @@ class JobLocation(Location):
         retention = RetentionExpression(retention) if retention else None
         compress = True if distutils.util.strtobool(parser.get(section, self.__KEY_COMPRESS, fallback='False')) \
             else False
+        
+        useRsync = True if distutils.util.strtobool(parser.get(section, self.__KEY_USE_RSYNC, fallback='False')) \
+            else False
         identical_filesystem = True if distutils.util.strtobool(parser.get(section, self.__KEY_IDENT_FS, fallback='False')) \
             else False
 
@@ -754,17 +887,19 @@ class JobLocation(Location):
         self.uuid = location_uuid
         self.retention = retention
         self.compress = compress
+        self.useRsync =useRsync
         self.identical_filesystem = identical_filesystem
 
         return corresponding_location
 
     def __str__(self):
-        return self._format_log_msg('url [%s] %sretention [%s] compress [%s] identical_filesystem[%s]'
+        return self._format_log_msg('url [%s] %sretention [%s] compress [%s] rsync [%s] identical_filesystem[%s]'
                                     % (self.url.geturl(),
                                        ('container [%s] ' % self.container_subvolume_relpath)
                                        if self.container_subvolume_relpath else '',
                                        self.retention,
                                        self.compress,
+                                       self.useRsync,
                                        self.identical_filesystem))
 
 
@@ -791,6 +926,7 @@ class Job:
              source_retention: RetentionExpression = None,
              dest_retention: RetentionExpression = None,
              compress: bool = None,
+             useRsync: bool = False,
              identical_filesystem: bool = False) -> 'Job':
         """
         Initializes a new backup job
@@ -799,6 +935,7 @@ class Job:
         :param source_retention: Source retention expression string
         :param dest_retention: Destination retention expression string
         :param compress: Compress flag
+        :param useRsync: Use Rsync for transfer flag
         :return: Backup job
         :rtype: Job
         """
@@ -840,6 +977,7 @@ class Job:
             source.compress = False
         if dest and not dest.compress:
             dest.compress = False
+        source.useRsync = useRsync
         
         # Check if the filesystem is on identical hosts
         if str(source.url.netloc) == str(dest.url.netloc):
@@ -1054,7 +1192,15 @@ class Job:
             final_dest_path = os.path.join(self.destination.url.path, str(new_snapshot_name))
 
             try:
-                self.source.transfer_btrfs_snapshot(self.destination,
+                if self.source.useRsync:
+                    self.source.transfer_btrfs_snapshot_withRsync(
+                        self.destination,
+                                                    source_path=temp_source_path,
+                                                    source_parent_path=source_parent_path,
+                                                    compress=self.source.compress,
+                                                    identical_filesystem=self.source.identical_filesystem)
+                else:
+                    self.source.transfer_btrfs_snapshot(self.destination,
                                                     source_path=temp_source_path,
                                                     source_parent_path=source_parent_path,
                                                     compress=self.source.compress,
